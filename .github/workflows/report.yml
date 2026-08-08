@@ -15,15 +15,14 @@ jobs:
           python-version: '3.11'
       - name: Install deps
         run: pip install --quiet pandas openpyxl requests python-amazon-sp-api
-      - name: Overwrite report.py with fixed version
+      - name: Overwrite report.py
         run: |
           cat > report.py << 'PY'
-          import os, requests
+          import os, requests, time
           from datetime import datetime, timedelta, timezone
           import pandas as pd
           KST = timezone(timedelta(hours=9))
           now_kst = datetime.now(KST)
-          print(f"리포트 실행: {now_kst} - JP/NA 2개 파일")
           LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID")
           LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
           REFRESH_TOKEN_JP = os.getenv("REFRESH_TOKEN_JP")
@@ -48,11 +47,22 @@ jobs:
                       for o in orders:
                           try: o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
                           except: o["Items"] = []
+                          # 주소
+                          try:
+                              addr_res = api.get_order_address(o["AmazonOrderId"])
+                              o["FullAddress"] = addr_res.payload.get("ShippingAddress", {}) if addr_res.payload else o.get("ShippingAddress", {})
+                          except: o["FullAddress"] = o.get("ShippingAddress", {})
+                          time.sleep(0.4)
+                          # 이메일 (BuyerInfo)
+                          try:
+                              buyer_res = api.get_order_buyer_info(o["AmazonOrderId"])
+                              o["BuyerEmail"] = buyer_res.payload.get("BuyerEmail", "") if buyer_res.payload else ""
+                          except:
+                              binfo = o.get("BuyerInfo", {})
+                              o["BuyerEmail"] = binfo.get("BuyerEmail","") if isinstance(binfo, dict) else ""
+                          time.sleep(0.4)
                           o["Marketplace"] = mp.name
-                      if is_jp:
-                          jp_orders.extend(orders)
-                      else:
-                          na_orders.extend(orders)
+                      (jp_orders if is_jp else na_orders).extend(orders)
                       print(f"{mp.name}: 미배송 {len(orders)}건")
                   except Exception as e:
                       print(f"{mp.name} 에러: {e}")
@@ -60,42 +70,44 @@ jobs:
           def make_file(orders, prefix):
               rows = []
               for o in orders:
-                  purchase = o.get("PurchaseDate", "")
-                  kst_str = ""
-                  if purchase:
-                      try: kst_str = pd.to_datetime(purchase).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M")
-                      except: kst_str = str(purchase)
-                  if not o.get("Items"):
-                      rows.append({"주문번호": o.get("AmazonOrderId",""), "주문시간(KST)": kst_str, "마켓": o.get("Marketplace",""), "상태": o.get("OrderStatus",""), "SKU": "-", "수량": 0})
-                  else:
-                      for item in o.get("Items", []):
-                          rows.append({"주문번호": o.get("AmazonOrderId",""), "주문시간(KST)": kst_str, "마켓": o.get("Marketplace",""), "상태": o.get("OrderStatus",""), "SKU": item.get("SellerSKU",""), "수량": item.get("QuantityOrdered","")})
-              if not rows:
-                  df = pd.DataFrame([{"주문번호": f"{prefix} 미배송 없음 ✅", "주문시간(KST)": now_kst.strftime("%Y-%m-%d %H:%M")}])
-              else:
-                  df = pd.DataFrame(rows)
+                  try: kst_str = pd.to_datetime(o.get("PurchaseDate","")).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M")
+                  except: kst_str = str(o.get("PurchaseDate",""))
+                  addr = o.get("FullAddress", {}) or {}
+                  order_total = o.get("OrderTotal", {}) or {}
+                  email = o.get("BuyerEmail","") or (o.get("BuyerInfo",{}) or {}).get("BuyerEmail","")
+                  for item in o.get("Items", []) or [{"SellerSKU":"-","QuantityOrdered":0}]:
+                      ip = item.get("ItemPrice", {}) if isinstance(item, dict) else {}
+                      rows.append({
+                          "주문번호": o.get("AmazonOrderId",""),
+                          "주문시간(KST)": kst_str,
+                          "마켓": o.get("Marketplace",""),
+                          "수령인": addr.get("Name",""),
+                          "이메일": email,
+                          "전화번호": addr.get("Phone",""),
+                          "주소1": addr.get("AddressLine1",""),
+                          "주소2": addr.get("AddressLine2",""),
+                          "도시": addr.get("City",""),
+                          "주/도": addr.get("StateOrRegion",""),
+                          "우편번호": addr.get("PostalCode",""),
+                          "국가": addr.get("CountryCode",""),
+                          "SKU": item.get("SellerSKU",""),
+                          "수량": item.get("QuantityOrdered",""),
+                          "상품판매가": ip.get("Amount","") if isinstance(ip, dict) else "",
+                          "통화": ip.get("CurrencyCode","") or order_total.get("CurrencyCode",""),
+                          "주문총액": order_total.get("Amount",""),
+                      })
+              df = pd.DataFrame(rows) if rows else pd.DataFrame([{"주문번호": f"{prefix} 미배송 없음 ✅"}])
               filename = f"FBM_{prefix}_Unshipped_{now_kst.strftime('%m%d_%H%M')}.xlsx"
               df.to_excel(filename, index=False)
-              print(f"엑셀 생성: {filename} {len(df)}행")
               return filename, df
           def send_telegram(jp_file, jp_df, na_file, na_df):
-              try:
-                  bot = TELEGRAM_BOT_TOKEN
-                  chat = TELEGRAM_CHAT_ID
-                  jp_cnt = 0 if "미배송 없음" in jp_df['주문번호'].iloc[0] else jp_df['주문번호'].nunique()
-                  na_cnt = 0 if "미배송 없음" in na_df['주문번호'].iloc[0] else na_df['주문번호'].nunique()
-                  text = f"📦 FBM 미배송 리포트 {now_kst.strftime('%m/%d %H시 KST')}\nJP: {jp_cnt}건 / NA: {na_cnt}건 / 총 {jp_cnt+na_cnt}건"
-                  requests.post(f"https://api.telegram.org/bot{bot}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15)
-                  # JP 파일 전송
-                  with open(jp_file, 'rb') as f:
-                      r = requests.post(f"https://api.telegram.org/bot{bot}/sendDocument", data={"chat_id": chat, "caption": f"🇯🇵 일본 미배송 {jp_cnt}건"}, files={"document": f}, timeout=30)
-                      print(f"JP 파일 전송: {r.status_code}")
-                  # NA 파일 전송
-                  with open(na_file, 'rb') as f:
-                      r = requests.post(f"https://api.telegram.org/bot{bot}/sendDocument", data={"chat_id": chat, "caption": f"🇺🇸 북미 미배송 {na_cnt}건"}, files={"document": f}, timeout=30)
-                      print(f"NA 파일 전송: {r.status_code}")
-              except Exception as e:
-                  print(f"텔레그램 실패: {e}")
+              bot, chat = TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+              def cnt(df): return 0 if "미배송 없음" in df['주문번호'].iloc[0] else df['주문번호'].nunique()
+              jp_c, na_c = cnt(jp_df), cnt(na_df)
+              requests.post(f"https://api.telegram.org/bot{bot}/sendMessage", json={"chat_id": chat, "text": f"📦 FBM 미배송 {now_kst.strftime('%m/%d %H시')}\nJP: {jp_c}건 / NA: {na_c}건\n(이메일/주소/판매가 포함)"}, timeout=15)
+              for fpath in [jp_file, na_file]:
+                  with open(fpath, 'rb') as f:
+                      requests.post(f"https://api.telegram.org/bot{bot}/sendDocument", data={"chat_id": chat}, files={"document": f}, timeout=30)
           if __name__ == "__main__":
               jp_orders, na_orders = fetch_fbm_orders()
               jp_file, jp_df = make_file(jp_orders, "JP")
