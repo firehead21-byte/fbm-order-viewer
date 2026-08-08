@@ -23,7 +23,7 @@ jobs:
           import pandas as pd
           KST = timezone(timedelta(hours=9))
           now_kst = datetime.now(KST)
-          print(f"리포트 실행: {now_kst} - 미배송 FBM VERSION")
+          print(f"리포트 실행: {now_kst} - 미배송 + 텔레그램 파일전송")
           LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID")
           LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
           REFRESH_TOKEN_JP = os.getenv("REFRESH_TOKEN_JP")
@@ -34,29 +34,20 @@ jobs:
               from sp_api.api import Orders
               from sp_api.base import Marketplaces
               all_orders = []
-              # 7일 이내 업데이트된 미배송 주문만 조회
               last_updated_after = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
               for mp, refresh in [(Marketplaces.JP, REFRESH_TOKEN_JP), (Marketplaces.US, REFRESH_TOKEN_NA), (Marketplaces.CA, REFRESH_TOKEN_NA), (Marketplaces.MX, REFRESH_TOKEN_NA)]:
                   if not refresh: continue
                   try:
                       creds = dict(lwa_app_id=LWA_CLIENT_ID, lwa_client_secret=LWA_CLIENT_SECRET, refresh_token=refresh)
                       api = Orders(credentials=creds, marketplace=mp)
-                      # 미배송 FBM 주문 조회
-                      res = api.get_orders(
-                          LastUpdatedAfter=last_updated_after,
-                          OrderStatuses=["Unshipped", "PartiallyShipped"],
-                          FulfillmentChannels=["MFN"]
-                      )
+                      res = api.get_orders(LastUpdatedAfter=last_updated_after, OrderStatuses=["Unshipped", "PartiallyShipped"], FulfillmentChannels=["MFN"])
                       orders = res.payload.get("Orders", []) if res.payload else []
-                      # NextToken으로 페이징 처리
                       while res.payload and res.payload.get("NextToken"):
                           res = api.get_orders(NextToken=res.payload["NextToken"])
                           orders.extend(res.payload.get("Orders", []) if res.payload else [])
                       for o in orders:
-                          try:
-                              o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
-                          except:
-                              o["Items"] = []
+                          try: o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
+                          except: o["Items"] = []
                           o["Marketplace"] = mp.name
                       all_orders.extend(orders)
                       print(f"{mp.name}: 미배송 {len(orders)}건")
@@ -69,39 +60,43 @@ jobs:
                   purchase = o.get("PurchaseDate", "")
                   kst_str = ""
                   if purchase:
-                      try:
-                          kst_str = pd.to_datetime(purchase).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M")
-                      except:
-                          kst_str = str(purchase)
+                      try: kst_str = pd.to_datetime(purchase).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M")
+                      except: kst_str = str(purchase)
                   for item in o.get("Items", []):
-                      rows.append({"주문번호": o.get("AmazonOrderId",""), "주문시간(KST)": kst_str, "마켓": o.get("Marketplace",""), "상태": o.get("OrderStatus",""), "SKU": item.get("SellerSKU",""), "수량": item.get("QuantityOrdered","")})
+                      rows.append({"주문번호": o.get("AmazonOrderId",""), "주문시간(KST)": kst_str, "마켓": o.get("Marketplace",""), "상태": o.get("OrderStatus",""), "SKU": item.get("SellerSKU",""), "수량": item.get("QuantityOrdered",""), "구매자": o.get("BuyerInfo",{}).get("BuyerEmail","") if isinstance(o.get("BuyerInfo"), dict) else ""})
               if not rows:
                   rows = [{"주문번호": "미배송 FBM 주문 없음 ✅", "주문시간(KST)": now_kst.strftime("%Y-%m-%d %H:%M"), "마켓": "-", "상태": "-", "SKU": "-", "수량": 0}]
               df = pd.DataFrame(rows)
-              df.to_excel(f"FBM_Unshipped_{now_kst.strftime('%m%d_%H%M')}.xlsx", index=False)
-              print(f"엑셀 생성 성공: {len(df)}행")
-              return f"FBM_Unshipped_{now_kst.strftime('%m%d_%H%M')}.xlsx", df
-          def send_telegram(df):
+              filename = f"FBM_Unshipped_{now_kst.strftime('%m%d_%H%M')}.xlsx"
+              df.to_excel(filename, index=False)
+              print(f"엑셀 생성: {filename}")
+              return filename, df
+          def send_telegram(df, filepath):
               try:
+                  bot_token = TELEGRAM_BOT_TOKEN
+                  chat_id = TELEGRAM_CHAT_ID
+                  # 1. 요약 메시지
                   if "미배송" in df['주문번호'].iloc[0]:
-                      text = f"✅ FBM 미배송 없음 {now_kst.strftime('%m/%d %H시 KST')}\n미배송 FBM 주문이 0건입니다!"
+                      text = f"✅ FBM 미배송 없음 {now_kst.strftime('%m/%d %H시 KST')}"
+                      url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                      requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
                   else:
-                      jp_df = df[df['마켓'] == 'JP']
-                      na_df = df[df['마켓']!= 'JP']
-                      text = f"📦 FBM 미배송 리포트 {now_kst.strftime('%m/%d %H시 KST')}\nJP: {jp_df['주문번호'].nunique()}건 / NA: {na_df['주문번호'].nunique()}건 / 총 {df['주문번호'].nunique()}건\n\n"
-                      if not jp_df.empty:
-                          text += "[JP 미배송]\n" + "\n".join([f"• {r['주문번호'][-6:]} | {r['SKU']} x{r['수량']} ({r['주문시간(KST)']})" for _,r in jp_df.iterrows()]) + "\n\n"
-                      if not na_df.empty:
-                          text += "[US/CA/MX 미배송]\n" + "\n".join([f"• {r['주문번호'][-6:]} | {r['SKU']} x{r['수량']} ({r['마켓']})" for _,r in na_df.iterrows()])
-                  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                  r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}, timeout=15)
-                  print(f"텔레그램 전송: {r.status_code}")
+                      jp = df[df['마켓'] == 'JP']['주문번호'].nunique()
+                      na = df[df['마켓']!= 'JP']['주문번호'].nunique()
+                      text = f"📦 FBM 미배송 {now_kst.strftime('%m/%d %H시 KST')}\nJP: {jp}건 / NA: {na}건 / 총 {df['주문번호'].nunique()}건"
+                      url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                      requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
+                      # 2. 엑셀 파일 전송
+                      url2 = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+                      with open(filepath, 'rb') as f:
+                          r = requests.post(url2, data={"chat_id": chat_id, "caption": f"{filepath} - 미배송 {df['주문번호'].nunique()}건"}, files={"document": f}, timeout=30)
+                      print(f"텔레그램 파일 전송: {r.status_code} {r.text[:300]}")
               except Exception as e:
                   print(f"텔레그램 실패: {e}")
           if __name__ == "__main__":
               orders = fetch_fbm_orders()
-              _, df = make_report(orders)
-              send_telegram(df)
+              xlsx_path, df = make_report(orders)
+              send_telegram(df, xlsx_path)
           PY
       - name: Run FBM Report
         env:
