@@ -23,50 +23,115 @@ jobs:
           import pandas as pd
           KST = timezone(timedelta(hours=9))
           now_kst = datetime.now(KST)
+          print(f"=== 디버그 실행: {now_kst} ===")
           LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID")
           LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
           REFRESH_TOKEN_JP = os.getenv("REFRESH_TOKEN_JP")
           REFRESH_TOKEN_NA = os.getenv("REFRESH_TOKEN_NA")
           TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
           TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+          def get_lwa_token(refresh):
+              r = requests.post("https://api.amazon.com/auth/o2/token", data={
+                  "grant_type":"refresh_token","refresh_token":refresh,
+                  "client_id":LWA_CLIENT_ID,"client_secret":LWA_CLIENT_SECRET
+              }, timeout=15)
+              print(f"LWA 토큰 발급: {r.status_code} {r.text[:500]}")
+              r.raise_for_status()
+              return r.json()["access_token"]
+
+          def get_rdt_and_address(lwa_token, order_id, region):
+              base_url = f"https://sellingpartnerapi-{region}.amazon.com"
+              headers = {"x-amz-access-token": lwa_token, "Content-Type":"application/json"}
+              body = {
+                  "restrictedResources": [
+                      {"method":"GET","path":f"/orders/v0/orders/{order_id}/address"},
+                      {"method":"GET","path":f"/orders/v0/orders/{order_id}/buyerInfo"}
+                  ]
+              }
+              try:
+                  rdt_res = requests.post(f"{base_url}/tokens/2021-03-01/restrictedDataToken", headers=headers, json=body, timeout=15)
+                  print(f"=== {order_id} RDT 결과 [{region}] ===")
+                  print(f"상태코드: {rdt_res.status_code}")
+                  print(f"응답: {rdt_res.text[:2000]}")
+                  if rdt_res.status_code != 200:
+                      return {}, ""
+                  rdt = rdt_res.json().get("restrictedDataToken","")
+                  if not rdt:
+                      print("RDT 토큰 없음!")
+                      return {}, ""
+                  rdt_headers = {"x-amz-access-token": rdt}
+                  addr_res = requests.get(f"{base_url}/orders/v0/orders/{order_id}/address", headers=rdt_headers, timeout=15)
+                  buyer_res = requests.get(f"{base_url}/orders/v0/orders/{order_id}/buyerInfo", headers=rdt_headers, timeout=15)
+                  print(f"주소조회 결과: {addr_res.status_code} - {addr_res.text[:2000]}")
+                  print(f"바이어조회 결과: {buyer_res.status_code} - {buyer_res.text[:2000]}")
+                  addr = {}
+                  email = ""
+                  if addr_res.status_code == 200:
+                      try:
+                          addr = addr_res.json().get("payload",{}).get("ShippingAddress",{})
+                      except: pass
+                  if buyer_res.status_code == 200:
+                      try:
+                          email = buyer_res.json().get("payload",{}).get("BuyerEmail","")
+                      except: pass
+                  return addr, email
+              except Exception as e:
+                  print(f"RDT 예외 {order_id}: {e}")
+                  import traceback; traceback.print_exc()
+                  return {}, ""
+
           def fetch_fbm_orders():
               from sp_api.api import Orders
               from sp_api.base import Marketplaces
               jp_orders, na_orders = [], []
               last_updated_after = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
-              for mp, refresh, is_jp in [(Marketplaces.JP, REFRESH_TOKEN_JP, True), (Marketplaces.US, REFRESH_TOKEN_NA, False), (Marketplaces.CA, REFRESH_TOKEN_NA, False), (Marketplaces.MX, REFRESH_TOKEN_NA, False)]:
-                  if not refresh: continue
+              for mp, refresh, is_jp, region in [
+                  (Marketplaces.JP, REFRESH_TOKEN_JP, True, "fe"),
+                  (Marketplaces.US, REFRESH_TOKEN_NA, False, "na"),
+              ]:
+                  if not refresh: 
+                      print(f"{mp.name} refresh 토큰 없음 스킵")
+                      continue
                   try:
+                      print(f"\n--- {mp.name} 처리 시작 ---")
+                      lwa_token = get_lwa_token(refresh)
                       creds = dict(lwa_app_id=LWA_CLIENT_ID, lwa_client_secret=LWA_CLIENT_SECRET, refresh_token=refresh)
                       api = Orders(credentials=creds, marketplace=mp)
                       res = api.get_orders(LastUpdatedAfter=last_updated_after, OrderStatuses=["Unshipped", "PartiallyShipped"], FulfillmentChannels=["MFN"])
                       orders = res.payload.get("Orders", []) if res.payload else []
-                      while res.payload and res.payload.get("NextToken"):
-                          res = api.get_orders(NextToken=res.payload["NextToken"])
-                          orders.extend(res.payload.get("Orders", []) if res.payload else [])
-                      for o in orders:
+                      print(f"{mp.name}: 미배송 {len(orders)}건 발견")
+                      if not orders:
+                          continue
+                      # 첫 주문 1개만 디버그로 주소 조회 (로그 너무 많아서)
+                      for o in orders[:1]:
+                          print(f"\n>> 테스트 주문: {o['AmazonOrderId']}")
+                          try: 
+                              o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
+                          except: 
+                              o["Items"] = []
+                          addr, email = get_rdt_and_address(lwa_token, o["AmazonOrderId"], region)
+                          o["FullAddress"] = addr
+                          o["BuyerEmail"] = email
+                          o["Marketplace"] = mp.name
+                          print(f"최종 주소 파싱: {addr}")
+                          print(f"최종 이메일 파싱: {email}")
+                          time.sleep(1)
+                      # 나머지는 기존 방식
+                      for o in orders[1:]:
                           try: o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
                           except: o["Items"] = []
-                          # 주소
-                          try:
-                              addr_res = api.get_order_address(o["AmazonOrderId"])
-                              o["FullAddress"] = addr_res.payload.get("ShippingAddress", {}) if addr_res.payload else o.get("ShippingAddress", {})
-                          except: o["FullAddress"] = o.get("ShippingAddress", {})
-                          time.sleep(0.4)
-                          # 이메일 (BuyerInfo)
-                          try:
-                              buyer_res = api.get_order_buyer_info(o["AmazonOrderId"])
-                              o["BuyerEmail"] = buyer_res.payload.get("BuyerEmail", "") if buyer_res.payload else ""
-                          except:
-                              binfo = o.get("BuyerInfo", {})
-                              o["BuyerEmail"] = binfo.get("BuyerEmail","") if isinstance(binfo, dict) else ""
-                          time.sleep(0.4)
+                          addr, email = get_rdt_and_address(lwa_token, o["AmazonOrderId"], region)
+                          o["FullAddress"] = addr
+                          o["BuyerEmail"] = email
                           o["Marketplace"] = mp.name
+                          time.sleep(0.8)
                       (jp_orders if is_jp else na_orders).extend(orders)
-                      print(f"{mp.name}: 미배송 {len(orders)}건")
                   except Exception as e:
                       print(f"{mp.name} 에러: {e}")
+                      import traceback; traceback.print_exc()
               return jp_orders, na_orders
+
           def make_file(orders, prefix):
               rows = []
               for o in orders:
@@ -74,13 +139,11 @@ jobs:
                   except: kst_str = str(o.get("PurchaseDate",""))
                   addr = o.get("FullAddress", {}) or {}
                   order_total = o.get("OrderTotal", {}) or {}
-                  email = o.get("BuyerEmail","") or (o.get("BuyerInfo",{}) or {}).get("BuyerEmail","")
+                  email = o.get("BuyerEmail","")
                   for item in o.get("Items", []) or [{"SellerSKU":"-","QuantityOrdered":0}]:
                       ip = item.get("ItemPrice", {}) if isinstance(item, dict) else {}
                       rows.append({
                           "주문번호": o.get("AmazonOrderId",""),
-                          "주문시간(KST)": kst_str,
-                          "마켓": o.get("Marketplace",""),
                           "수령인": addr.get("Name",""),
                           "이메일": email,
                           "전화번호": addr.get("Phone",""),
@@ -93,21 +156,23 @@ jobs:
                           "SKU": item.get("SellerSKU",""),
                           "수량": item.get("QuantityOrdered",""),
                           "상품판매가": ip.get("Amount","") if isinstance(ip, dict) else "",
-                          "통화": ip.get("CurrencyCode","") or order_total.get("CurrencyCode",""),
                           "주문총액": order_total.get("Amount",""),
                       })
               df = pd.DataFrame(rows) if rows else pd.DataFrame([{"주문번호": f"{prefix} 미배송 없음 ✅"}])
               filename = f"FBM_{prefix}_Unshipped_{now_kst.strftime('%m%d_%H%M')}.xlsx"
               df.to_excel(filename, index=False)
               return filename, df
+
           def send_telegram(jp_file, jp_df, na_file, na_df):
               bot, chat = TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-              def cnt(df): return 0 if "미배송 없음" in df['주문번호'].iloc[0] else df['주문번호'].nunique()
-              jp_c, na_c = cnt(jp_df), cnt(na_df)
-              requests.post(f"https://api.telegram.org/bot{bot}/sendMessage", json={"chat_id": chat, "text": f"📦 FBM 미배송 {now_kst.strftime('%m/%d %H시')}\nJP: {jp_c}건 / NA: {na_c}건\n(이메일/주소/판매가 포함)"}, timeout=15)
-              for fpath in [jp_file, na_file]:
-                  with open(fpath, 'rb') as f:
-                      requests.post(f"https://api.telegram.org/bot{bot}/sendDocument", data={"chat_id": chat}, files={"document": f}, timeout=30)
+              if bot and chat:
+                  requests.post(f"https://api.telegram.org/bot{bot}/sendMessage", json={"chat_id": chat, "text": f"🧪 디버그 실행 완료 - 로그 확인해줘!"}, timeout=15)
+                  for fpath in [jp_file, na_file]:
+                      try:
+                          with open(fpath, 'rb') as f:
+                              requests.post(f"https://api.telegram.org/bot{bot}/sendDocument", data={"chat_id": chat}, files={"document": f}, timeout=30)
+                      except: pass
+
           if __name__ == "__main__":
               jp_orders, na_orders = fetch_fbm_orders()
               jp_file, jp_df = make_file(jp_orders, "JP")
