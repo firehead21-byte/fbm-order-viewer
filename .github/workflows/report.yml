@@ -1,0 +1,31 @@
+name: FBM Report KST
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 09:00 KST = 00:00 UTC
+    - cron: '0 3 * * *'   # 12:00 KST = 03:00 UTC
+    - cron: '0 6 * * *'   # 15:00 KST = 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          pip install python-amazon-sp-api pandas openpyxl requests google-api-python-client google-auth
+      - name: Run FBM Report
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          REFRESH_TOKEN_JP: ${{ secrets.REFRESH_TOKEN_JP }}
+          REFRESH_TOKEN_NA: ${{ secrets.REFRESH_TOKEN_NA }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: python report.py
