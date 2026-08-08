@@ -1,12 +1,10 @@
 name: FBM Report KST
-
 on:
   schedule:
-    - cron: '0 0 * * *'   # 09:00 KST = 00:00 UTC
-    - cron: '0 3 * * *'   # 12:00 KST = 03:00 UTC
-    - cron: '0 6 * * *'   # 15:00 KST = 06:00 UTC
+    - cron: '0 0 * * *'
+    - cron: '0 3 * * *'
+    - cron: '0 6 * * *'
   workflow_dispatch:
-
 jobs:
   report:
     runs-on: ubuntu-latest
@@ -15,9 +13,78 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
       - name: Install deps
+        run: pip install --quiet pandas openpyxl requests python-amazon-sp-api
+      - name: Overwrite report.py with fixed version
         run: |
-          pip install python-amazon-sp-api pandas openpyxl requests google-api-python-client google-auth
+          cat > report.py << 'PY'
+          import os, requests
+          from datetime import datetime, timedelta, timezone
+          import pandas as pd
+          KST = timezone(timedelta(hours=9))
+          now_kst = datetime.now(KST)
+          print(f"리포트 실행: {now_kst} - FIXED VERSION")
+          LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID")
+          LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
+          REFRESH_TOKEN_JP = os.getenv("REFRESH_TOKEN_JP")
+          REFRESH_TOKEN_NA = os.getenv("REFRESH_TOKEN_NA")
+          TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+          def fetch_fbm_orders():
+              from sp_api.api import Orders
+              from sp_api.base import Marketplaces
+              all_orders = []
+              for mp, refresh in [(Marketplaces.JP, REFRESH_TOKEN_JP), (Marketplaces.US, REFRESH_TOKEN_NA), (Marketplaces.CA, REFRESH_TOKEN_NA), (Marketplaces.MX, REFRESH_TOKEN_NA)]:
+                  if not refresh: continue
+                  try:
+                      creds = dict(lwa_app_id=LWA_CLIENT_ID, lwa_client_secret=LWA_CLIENT_SECRET, refresh_token=refresh)
+                      api = Orders(credentials=creds, marketplace=mp)
+                      created_after = (datetime.utcnow() - timedelta(hours=3, minutes=30)).isoformat() + "Z"
+                      res = api.get_orders(CreatedAfter=created_after, FulfillmentChannels=["MFN"])
+                      orders = res.payload.get("Orders", []) if res.payload else []
+                      for o in orders:
+                          try:
+                              o["Items"] = api.get_order_items(o["AmazonOrderId"]).payload.get("OrderItems", [])
+                          except:
+                              o["Items"] = []
+                          o["Marketplace"] = mp.name
+                      all_orders.extend(orders)
+                      print(f"{mp.name}: {len(orders)}건")
+                  except Exception as e:
+                      print(f"{mp.name} 에러: {e}")
+              return all_orders
+          def make_report(orders):
+              rows = []
+              for o in orders:
+                  purchase = o.get("PurchaseDate", "")
+                  kst_str = ""
+                  if purchase:
+                      try:
+                          kst_str = pd.to_datetime(purchase).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S")
+                      except:
+                          kst_str = str(purchase)
+                  for item in o.get("Items", []):
+                      rows.append({"주문번호": o.get("AmazonOrderId",""), "주문시간(KST)": kst_str, "마켓": o.get("Marketplace",""), "SKU": item.get("SellerSKU",""), "수량": item.get("QuantityOrdered","")})
+              if not rows:
+                  rows = [{"주문번호": "최근 3시간 주문 없음", "주문시간(KST)": now_kst.strftime("%Y-%m-%d %H:%M:%S"), "SKU": "-", "수량": 0}]
+              df = pd.DataFrame(rows)
+              df.to_excel(f"FBM_{now_kst.strftime('%m%d_%H%M')}.xlsx", index=False)
+              print(f"엑셀 생성 성공: {len(df)}행")
+              return "ok.xlsx", df
+          def send_telegram(df):
+              try:
+                  text = f"📦 FBM 리포트 {now_kst.strftime('%m/%d %H시 KST')}\n총 {df['주문번호'].nunique()}건\n" + "\n".join([f"• {r['주문번호']} | {r['SKU']} x{r['수량']}" for _,r in df.head(20).iterrows()])
+                  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                  r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}, timeout=15)
+                  print(f"텔레그램 전송: {r.status_code} {r.text[:200]}")
+              except Exception as e:
+                  print(f"텔레그램 실패: {e}")
+          if __name__ == "__main__":
+              orders = fetch_fbm_orders()
+              _, df = make_report(orders)
+              send_telegram(df)
+          PY
       - name: Run FBM Report
         env:
           LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
@@ -26,6 +93,4 @@ jobs:
           REFRESH_TOKEN_NA: ${{ secrets.REFRESH_TOKEN_NA }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
         run: python report.py
